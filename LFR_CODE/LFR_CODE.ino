@@ -1,209 +1,264 @@
-#include <SoftwareSerial.h>
+/*********
+  Rui Santos
+  Complete project details at https://RandomNerdTutorials.com/esp32-cam-video-streaming-web-server-camera-home-assistant/
+  
+  IMPORTANT!!! 
+   - Select Board "AI Thinker ESP32-CAM"
+   - GPIO 0 must be connected to GND to upload a sketch
+   - After connecting GPIO 0 to GND, press the ESP32-CAM on-board RESET button to put your board in flashing mode
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files.
 
-// Motor Control Pins
-int PA = 6;
-int PB = 9;
-int AI1 = 4;
-int AI2 = 5;
-int BI1 = 7;
-int BI2 = 8;
-// STDBY ALWAYS HIGH
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+*********/
 
-// 8-Channel IR Sensor Array Setup
-const byte IrIn[8] = {10, 11, 12, 13, A0, A1, A2, A3};
-const int weights[8] = {-45, -30, -15, -5, 5, 15, 30, 45};
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "fb_gfx.h"
+#include "soc/soc.h" //disable brownout problems
+#include "soc/rtc_cntl_reg.h"  //disable brownout problems
+#include "esp_http_server.h"
 
-// Peripherals
-int Buzz = 1; 
-int BtTx = 2;
-int BtRx = 3;
-int SwitchPin = A6; 
+//Replace with your network credentials
+const char* ssid = "Souptik";
+const char* password = "26596204";
 
-// Base Operational Parameters (Marked non-const so your phone can overwrite them!)
-int BaseSpeed = 70; 
-bool robotRunning = false; 
+#define PART_BOUNDARY "123456789000000000000987654321"
 
-// PID Tuning Parameters (Marked non-const so your phone can overwrite them!)
-float Kp = 2.8;  
-float Kd = 1.2;  
-float Ki = 0.005; 
+// This project was tested with the AI Thinker Model, M5STACK PSRAM Model and M5STACK WITHOUT PSRAM
+#define CAMERA_MODEL_AI_THINKER
+//#define CAMERA_MODEL_M5STACK_PSRAM
+//#define CAMERA_MODEL_M5STACK_WITHOUT_PSRAM
 
-// PID Calculation Registers
-int lastError = 0;
-long integral = 0;
+// Not tested with this model
+//#define CAMERA_MODEL_WROVER_KIT
 
-// Timing Registers for Non-Blocking Logic
-unsigned long lastDebugTime = 0;
-unsigned long lastSwitchCheck = 0; 
+#if defined(CAMERA_MODEL_WROVER_KIT)
+  #define PWDN_GPIO_NUM    -1
+  #define RESET_GPIO_NUM   -1
+  #define XCLK_GPIO_NUM    21
+  #define SIOD_GPIO_NUM    26
+  #define SIOC_GPIO_NUM    27
+  
+  #define Y9_GPIO_NUM      35
+  #define Y8_GPIO_NUM      34
+  #define Y7_GPIO_NUM      39
+  #define Y6_GPIO_NUM      36
+  #define Y5_GPIO_NUM      19
+  #define Y4_GPIO_NUM      18
+  #define Y3_GPIO_NUM       5
+  #define Y2_GPIO_NUM       4
+  #define VSYNC_GPIO_NUM   25
+  #define HREF_GPIO_NUM    23
+  #define PCLK_GPIO_NUM    22
 
-// Initialize SoftwareSerial for Bluetooth (RX, TX)
-SoftwareSerial bluetooth(BtRx, BtTx); 
+#elif defined(CAMERA_MODEL_M5STACK_PSRAM)
+  #define PWDN_GPIO_NUM     -1
+  #define RESET_GPIO_NUM    15
+  #define XCLK_GPIO_NUM     27
+  #define SIOD_GPIO_NUM     25
+  #define SIOC_GPIO_NUM     23
+  
+  #define Y9_GPIO_NUM       19
+  #define Y8_GPIO_NUM       36
+  #define Y7_GPIO_NUM       18
+  #define Y6_GPIO_NUM       39
+  #define Y5_GPIO_NUM        5
+  #define Y4_GPIO_NUM       34
+  #define Y3_GPIO_NUM       35
+  #define Y2_GPIO_NUM       32
+  #define VSYNC_GPIO_NUM    22
+  #define HREF_GPIO_NUM     26
+  #define PCLK_GPIO_NUM     21
+
+#elif defined(CAMERA_MODEL_M5STACK_WITHOUT_PSRAM)
+  #define PWDN_GPIO_NUM     -1
+  #define RESET_GPIO_NUM    15
+  #define XCLK_GPIO_NUM     27
+  #define SIOD_GPIO_NUM     25
+  #define SIOC_GPIO_NUM     23
+  
+  #define Y9_GPIO_NUM       19
+  #define Y8_GPIO_NUM       36
+  #define Y7_GPIO_NUM       18
+  #define Y6_GPIO_NUM       39
+  #define Y5_GPIO_NUM        5
+  #define Y4_GPIO_NUM       34
+  #define Y3_GPIO_NUM       35
+  #define Y2_GPIO_NUM       17
+  #define VSYNC_GPIO_NUM    22
+  #define HREF_GPIO_NUM     26
+  #define PCLK_GPIO_NUM     21
+
+#elif defined(CAMERA_MODEL_AI_THINKER)
+  #define PWDN_GPIO_NUM     32
+  #define RESET_GPIO_NUM    -1
+  #define XCLK_GPIO_NUM      0
+  #define SIOD_GPIO_NUM     26
+  #define SIOC_GPIO_NUM     27
+  
+  #define Y9_GPIO_NUM       35
+  #define Y8_GPIO_NUM       34
+  #define Y7_GPIO_NUM       39
+  #define Y6_GPIO_NUM       36
+  #define Y5_GPIO_NUM       21
+  #define Y4_GPIO_NUM       19
+  #define Y3_GPIO_NUM       18
+  #define Y2_GPIO_NUM        5
+  #define VSYNC_GPIO_NUM    25
+  #define HREF_GPIO_NUM     23
+  #define PCLK_GPIO_NUM     22
+#else
+  #error "Camera model not selected"
+#endif
+
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t stream_httpd = NULL;
+
+static esp_err_t stream_handler(httpd_req_t *req){
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t * _jpg_buf = NULL;
+  char * part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if(res != ESP_OK){
+    return res;
+  }
+
+  while(true){
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      if(fb->width > 400){
+        if(fb->format != PIXFORMAT_JPEG){
+          bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+          esp_camera_fb_return(fb);
+          fb = NULL;
+          if(!jpeg_converted){
+            Serial.println("JPEG compression failed");
+            res = ESP_FAIL;
+          }
+        } else {
+          _jpg_buf_len = fb->len;
+          _jpg_buf = fb->buf;
+        }
+      }
+    }
+    if(res == ESP_OK){
+      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if(res == ESP_OK){
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+    if(res == ESP_OK){
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+    if(fb){
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      _jpg_buf = NULL;
+    } else if(_jpg_buf){
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+    if(res != ESP_OK){
+      break;
+    }
+    //Serial.printf("MJPG: %uB\n",(uint32_t)(_jpg_buf_len));
+  }
+  return res;
+}
+
+void startCameraServer(){
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  httpd_uri_t index_uri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = stream_handler,
+    .user_ctx  = NULL
+  };
+  
+  //Serial.printf("Starting web server on port: '%d'\n", config.server_port);
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &index_uri);
+  }
+}
 
 void setup() {
-  Serial.begin(9600);
-  bluetooth.begin(9600);
-
-  // Configure H-Bridge Pins
-  pinMode(PA, OUTPUT);
-  pinMode(PB, OUTPUT);
-  pinMode(AI1, OUTPUT);
-  pinMode(AI2, OUTPUT);
-  pinMode(BI1, OUTPUT);
-  pinMode(BI2, OUTPUT);
-  pinMode(Buzz, OUTPUT);
-
-  // Configure IR Array Pins
-  for (int i = 0; i < 8; i++) {
-    pinMode(IrIn[i], INPUT);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
+ 
+  Serial.begin(115200);
+  Serial.setDebugOutput(false);
+  
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; 
+  
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
   }
   
-  // Startup chime
-  digitalWrite(Buzz, HIGH);
-  delay(150);
-  digitalWrite(Buzz, LOW);
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+  // Wi-Fi connection
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  
+  Serial.print("Camera Stream Ready! Go to: http://");
+  Serial.print(WiFi.localIP());
+  
+  // Start streaming web server
+  startCameraServer();
 }
 
 void loop() {
-  // --- COMMENT THIS SINGLE LINE BELOW TO DISABLE PHONE TUNING LATER ---
-  checkBluetoothTuning();
-
-  // --- FAST ANALOG SWITCH POLLING BYPASS (Runs every 50ms) ---
-  if (millis() - lastSwitchCheck > 50) {
-    lastSwitchCheck = millis();
-    int switchVal = analogRead(SwitchPin);
-    
-    if (switchVal < 200) {
-      robotRunning = !robotRunning; 
-      
-      digitalWrite(Buzz, HIGH);
-      delay(80); 
-      digitalWrite(Buzz, LOW);
-      
-      if (robotRunning) {
-        integral = 0;
-        lastError = 0;
-      }
-    }
-  }
-
-  // Idle Protection Safeguard
-  if (!robotRunning) {
-    ML(0); 
-    MR(0); 
-    
-    if (millis() - lastDebugTime > 250) {
-      lastDebugTime = millis();
-      Serial.println("STATUS: IDLE - Press A6 Switch to Start");
-      bluetooth.println("STATUS: IDLE - Press A6 Switch to Start");
-    }
-    return; 
-  }
-
-  // --- CORE PID LINE TRACKING ENGINE ---
-  long totalWeight = 0;
-  int activeSensors = 0;
-
-  for (int i = 0; i < 8; i++) {
-    if (digitalRead(IrIn[i]) == HIGH) { 
-      totalWeight += weights[i];
-      activeSensors++;
-    }
-  }
-
-  int error = 0;
-  if (activeSensors > 0) {
-    error = totalWeight / activeSensors; 
-  } else {
-    return; 
-  }
-
-  // Compute Active PID Control Values
-  integral += error;                    
-  integral = constrain(integral, -500, 500); 
-  int derivative = error - lastError;   
-  
-  int motorAdjustment = (error * Kp) + (integral * Ki) + (derivative * Kd);
-  lastError = error; 
-
-  int leftSpeed = BaseSpeed + motorAdjustment;
-  int rightSpeed = BaseSpeed - motorAdjustment;
-
-  leftSpeed = constrain(leftSpeed, -255, 255);
-  rightSpeed = constrain(rightSpeed, -255, 255);
-
-  ML(leftSpeed);  
-  MR(rightSpeed); 
-
-  // --- TELEMETRY PERFORMANCE STREAMING (Every 100ms) ---
-  if (millis() - lastDebugTime > 100) {
-    lastDebugTime = millis();
-    
-    // Notice that this now prints live Kp, Kd, Ki, and Speed values so you can see changes!
-    String debugMsg = "P=" + String(Kp) + " D=" + String(Kd) + " S=" + String(BaseSpeed) + " | Err: " + String(error);
-    
-    Serial.println(debugMsg);
-    bluetooth.println(debugMsg);
-  }
-}
-
-// ==========================================
-// STANDALONE BLUETOOTH TUNING ENGINE
-// ==========================================
-void checkBluetoothTuning() {
-  if (bluetooth.available() > 0) {
-    char token = bluetooth.read();       // Read the first character (P, I, D, or S)
-    float value = bluetooth.parseFloat(); // Read the numeric float value following it
-    
-    // Quick confirm double-click noise on the buzzer to acknowledge receipt
-    digitalWrite(Buzz, HIGH); delay(20); digitalWrite(Buzz, LOW); delay(20);
-    digitalWrite(Buzz, HIGH); delay(20); digitalWrite(Buzz, LOW);
-
-    switch (token) {
-      case 'P': case 'p':
-        Kp = value;
-        bluetooth.print("--> Kp updated to: "); bluetooth.println(Kp);
-        break;
-      case 'D': case 'd':
-        Kd = value;
-        bluetooth.print("--> Kd updated to: "); bluetooth.println(Kd);
-        break;
-      case 'I': case 'i':
-        Ki = value;
-        bluetooth.print("--> Ki updated to: "); bluetooth.println(Ki);
-        break;
-      case 'S': case 's':
-        BaseSpeed = (int)value;
-        bluetooth.print("--> BaseSpeed updated to: "); bluetooth.println(BaseSpeed);
-        break;
-      default:
-        bluetooth.println("ERROR: Invalid command token. Use P, D, I, or S.");
-        break;
-    }
-  }
-}
-
-// Logic Controller for Left Drive (Motor A)
-void ML(int speed) {
-  if (speed >= 0) {
-    digitalWrite(AI1, HIGH);
-    digitalWrite(AI2, LOW);
-  } else {
-    digitalWrite(AI1, LOW);
-    digitalWrite(AI2, HIGH);
-    speed = -speed; 
-  }
-  analogWrite(PA, speed);
-}
-
-// Logic Controller for Right Drive (Motor B)
-void MR(int speed) {
-  if (speed >= 0) {
-    digitalWrite(BI1, HIGH);
-    digitalWrite(BI2, LOW);
-  } else {
-    digitalWrite(BI1, LOW);
-    digitalWrite(BI2, HIGH);
-    speed = -speed; 
-  }
-  analogWrite(PB, speed);
+  delay(1);
 }
